@@ -77,11 +77,14 @@ jobs:
             printf 'All:\n%s\n' "${ALL[@]}"
             exit 1
           fi
-          # Serialize to JSON array for matrix or single-loop
-          printf '%s' "$(printf '%s\n' "${PACKABLE[@]}" | jq -R . | jq -s .)" > projects.json
-          echo "json=$(cat projects.json)" >> "$GITHUB_OUTPUT"
+
+          # Build a compact, single-line JSON array for outputs (no newlines)
+          paths_json=$(printf '%s\n' "${PACKABLE[@]}" | jq -R -s -c 'split("\n")[:-1]')
+          echo "json=$paths_json" >> "$GITHUB_OUTPUT"
+
+          # Pretty-print to logs for visibility
           echo "Detected packable projects:"
-          cat projects.json
+          printf '%s\n' "$paths_json" | jq .
 
       - name: Compute NuGet version from tag & release type
         id: ver
