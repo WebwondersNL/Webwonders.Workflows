@@ -1,0 +1,144 @@
+﻿name: Publish NuGet Package (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      dotnet-version:
+        description: '.NET SDK version'
+        required: false
+        default: '8.0.x'
+        type: string
+      prerelease-label:
+        description: 'Suffix when Release is marked pre-release (ignored if tag already has suffix)'
+        required: false
+        default: 'beta'
+        type: string
+      project-glob:
+        description: 'Glob to find packable .csproj files'
+        required: false
+        default: 'src/**/*.csproj'
+        type: string
+      require-branch-regex:
+        description: 'Regex of allowed base branches for the tagged commit'
+        required: false
+        default: '^(main|release/[0-9]+\.x)$'
+        type: string
+      environment-name:
+        description: 'Optional environment name in the caller repo (e.g., nuget-prod)'
+        required: false
+        default: ''
+        type: string
+    secrets:
+      NUGET_API_KEY:
+        description: 'NuGet.org API key scoped to the caller repo’s package'
+        required: true
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # Apply the environment in the CALLER repo if provided
+    environment: ${{ inputs.environment-name || '' }}
+    permissions:
+      contents: read
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ inputs.dotnet-version }}
+
+      - name: Find packable project(s)
+        id: projects
+        shell: bash
+        run: |
+          shopt -s nullglob globstar
+          mapfile -t ALL < <(printf "%s\n" ${{ inputs.project-glob }})
+          if [ ${#ALL[@]} -eq 0 ]; then
+            echo "No .csproj matches '${{ inputs.project-glob }}'." >&2
+            exit 1
+          fi
+          PACKABLE=()
+          for p in "${ALL[@]}"; do
+            if ! grep -q "<IsPackable>false</IsPackable>" "$p"; then
+              PACKABLE+=("$p")
+            fi
+          done
+          if [ ${#PACKABLE[@]} -eq 0 ]; then
+            echo "Found projects, but none are packable." >&2
+            printf 'All:\n%s\n' "${ALL[@]}"
+            exit 1
+          fi
+          # Serialize to JSON array for matrix or single-loop
+          printf '%s' "$(printf '%s\n' "${PACKABLE[@]}" | jq -R . | jq -s .)" > projects.json
+          echo "json=$(cat projects.json)" >> "$GITHUB_OUTPUT"
+          echo "Detected packable projects:"
+          cat projects.json
+
+      - name: Compute NuGet version from tag & release type
+        id: ver
+        shell: bash
+        env:
+          IS_PRERELEASE: ${{ github.event.release.prerelease }}
+          RUN: ${{ github.run_number }}
+          LABEL: ${{ inputs.prerelease-label }}
+        run: |
+          t="${GITHUB_REF#refs/tags/}"
+          v="${t#v}"
+          if [[ ! "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Tag '$t' must be like v1.2.3 or v1.2.3-beta.1"; exit 1
+          fi
+          if [[ "$v" == *-* ]]; then
+            nuget_version="$v"  # already pre-release
+          else
+            if [[ "$IS_PRERELEASE" == "true" ]]; then
+              nuget_version="${v}-${LABEL}.${RUN}"
+            else
+              nuget_version="$v"
+            fi
+          fi
+          echo "value=$nuget_version" >> "$GITHUB_OUTPUT"
+          echo "Computed NuGet version: $nuget_version"
+
+      - name: Enforce allowed base branches
+        shell: bash
+        run: |
+          regex='${{ inputs.require-branch-regex }}'
+          branches=$(git branch -r --contains "$GITHUB_SHA" | sed 's#origin/##' | xargs)
+          echo "Tag is on branches: $branches"
+          echo "$branches" | grep -E "\b${regex}\b" >/dev/null || { echo "Tag not on allowed branches (${regex})"; exit 1; }
+
+      - name: Restore / Build / Pack each project
+        shell: bash
+        run: |
+          projects=$(jq -r '.[]' <<< '${{ steps.projects.outputs.json }}')
+          mkdir -p artifacts
+          while IFS= read -r csproj; do
+            echo "==> Building $csproj"
+            dotnet restore "$csproj"
+            dotnet build   "$csproj" -c Release --no-restore
+            dotnet pack    "$csproj" -c Release -o ./artifacts --no-build \
+              /p:ContinuousIntegrationBuild=true \
+              /p:Version=${{ steps.ver.outputs.value }} \
+              /p:IncludeSymbols=true \
+              /p:SymbolPackageFormat=snupkg
+          done <<< "$projects"
+
+      - name: Push to NuGet.org
+        run: |
+          dotnet nuget push "./artifacts/*.nupkg"  --api-key "${{ secrets.NUGET_API_KEY }}" --source "https://api.nuget.org/v3/index.json" --skip-duplicate
+          dotnet nuget push "./artifacts/*.snupkg" --api-key "${{ secrets.NUGET_API_KEY }}" --source "https://api.nuget.org/v3/index.json" --skip-duplicate
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nupkgs-${{ steps.ver.outputs.value }}
+          path: artifacts/
