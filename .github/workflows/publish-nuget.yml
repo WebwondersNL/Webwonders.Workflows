@@ -115,9 +115,10 @@ jobs:
         shell: bash
         run: |
           regex='${{ inputs.require-branch-regex }}'
-          branches=$(git branch -r --contains "$GITHUB_SHA" | sed 's#origin/##' | xargs)
-          echo "Tag is on branches: $branches"
-          echo "$branches" | grep -E "\b${regex}\b" >/dev/null || { echo "Tag not on allowed branches (${regex})"; exit 1; }
+          # One branch per line so an anchored regex is matched against each branch on its own
+          branches=$(git branch -r --contains "$GITHUB_SHA" --format='%(refname:lstrip=3)')
+          echo "Tag is on branches: $(echo $branches)"
+          grep -Eq "${regex}" <<< "$branches" || { echo "Tag not on allowed branches (${regex})"; exit 1; }
 
       - name: Restore / Build / Pack each project
         shell: bash
